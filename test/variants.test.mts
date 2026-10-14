@@ -1,4 +1,4 @@
-// 两版并存的注册契约：`workbuddy`（国内版）与 `workbuddy-ai`（国际版）各自
+// 两版并存的注册契约：`workbuddy-cn`（国内版）与 `workbuddy-ai`（国际版）各自
 // 使用自己的 base URL 与标记头，模型目录不互相污染，scope 过滤对两版都生效。
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,12 +21,12 @@ await ext.default(pi);
 
 const ids = registered.map((entry) => entry.id);
 if (ids.length !== 2) throw new Error(`expected 2 providers, got ${ids.length}: ${ids.join(", ")}`);
-if (!ids.includes("workbuddy")) throw new Error("missing CN provider 'workbuddy'");
+if (!ids.includes("workbuddy-cn")) throw new Error("missing CN provider 'workbuddy-cn'");
 if (!ids.includes("workbuddy-ai")) throw new Error("missing international provider 'workbuddy-ai'");
 
 // 每版的 base URL 必须指向自己的站点；混用会让国内版打到国际版接口上。
 const byId = new Map(registered.map((entry) => [entry.id, entry.cfg]));
-const cn = byId.get("workbuddy")!;
+const cn = byId.get("workbuddy-cn")!;
 const ai = byId.get("workbuddy-ai")!;
 if (!String(cn.baseUrl).startsWith("https://www.codebuddy.cn")) {
   throw new Error(`CN base URL wrong: ${cn.baseUrl}`);
@@ -40,7 +40,7 @@ if (ai.name !== "WorkBuddy AI") throw new Error(`international name wrong: ${ai.
 // 标记头必须能区分两版，否则 before_provider_headers 无法把请求路由到正确凭据。
 const cnMarker = cn.headers?.["X-Pi-WorkBuddy"];
 const aiMarker = ai.headers?.["X-Pi-WorkBuddy"];
-if (cnMarker !== "workbuddy") throw new Error(`CN marker wrong: ${String(cnMarker)}`);
+if (cnMarker !== "workbuddy-cn") throw new Error(`CN marker wrong: ${String(cnMarker)}`);
 if (aiMarker !== "workbuddy-ai") throw new Error(`international marker wrong: ${String(aiMarker)}`);
 if (cnMarker === aiMarker) throw new Error("markers must differ between variants");
 

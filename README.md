@@ -20,7 +20,7 @@ pi -e /path/to/pi-workbuddy-connect
 
 | provider id | 产品 | chat 接口 | 计费接口 | 桌面认证文件 |
 | --- | --- | --- | --- | --- |
-| `workbuddy` | WorkBuddy（国内版） | `copilot.tencent.com` | `www.codebuddy.cn` | `workbuddy-desktop.info` |
+| `workbuddy-cn` | WorkBuddy（国内版） | `copilot.tencent.com` | `www.codebuddy.cn` | `workbuddy-desktop.info` |
 | `workbuddy-ai` | WorkBuddy AI（国际版） | `www.workbuddy.ai` | `www.workbuddy.ai` | `workbuddy-desktop-ai.info` |
 
 两版的模型、账号与积分**互不混用**；各自只跟随对应桌面 App 的登录状态。只登录一版就只出现该版的分组，两版都登录则两组并存。没登录的那版整组隐藏——不显示一份选了必然报错的兜底列表。
@@ -36,7 +36,7 @@ pi -e /path/to/pi-workbuddy-connect
 凭据解析优先级：
 
 1. `WORKBUDDY_AUTH_FILE`（国内版）/ `WORKBUDDY_AI_AUTH_FILE`（国际版）指定的文件
-2. pi 自存的 `.workbuddy-auth.json`（国内版）/ `.workbuddy-ai-auth.json`（国际版）
+2. pi 自存的 `.workbuddy-cn-auth.json`（国内版）/ `.workbuddy-ai-auth.json`（国际版）
 3. 桌面 App 的认证文件（macOS / Windows / Linux）
 
 access token 过期前 5 分钟自动续期，续期结果只写插件自有的副本，**绝不写桌面 App 的文件**。
@@ -81,6 +81,21 @@ WorkBuddy 5.6 起，两版桌面 App 会把 `auth.accessToken` / `auth.refreshTo
 - **国内版企业账号**（`enterpriseId` 非空）：走 `/v2/billing/meter/get-enterprise-user-usage`，显示单一周期额度；上游 `-1` 是「无上限」标记，显示为「无上限」而不是数字。
 
 积分不自动轮询（每次读取都是真实计费查询），`/workbuddy` 刷新时读取一次。
+
+## 打包
+
+本仓库按 pi package 格式发布（`keywords` 含 `pi-package`，`package.json` 的 `pi.extensions` 指向 `./extensions`）。
+
+```bash
+npm pack --dry-run   # 确认 tarball 内容
+```
+
+要点：
+
+- `files` 只白名单 `extensions` / `README.md` / `LICENSE`，测试与 tsconfig 不进包。
+- 宿主提供的 `@earendil-works/pi-ai` 与 `@earendil-works/pi-coding-agent` 声明在 `peerDependencies`（`"*"`），**不**放进 `dependencies`，也不打包——物理副本会绕过 pi 的扩展模块映射，产生重复的类与注册表。
+- `typescript` 仅在 `devDependencies`，不随包分发。
+
 
 ## 环境变量
 

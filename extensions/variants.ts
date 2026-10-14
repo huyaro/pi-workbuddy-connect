@@ -35,16 +35,16 @@ export interface WorkBuddyVariant {
   electronEnv: string;
 }
 
-/** 国内版：沿用既有 id 与路径，作为兼容锚点。 */
+/** 国内版。 */
 export const CN_VARIANT: WorkBuddyVariant = {
-  id: "workbuddy",
+  id: "workbuddy-cn",
   displayName: "WorkBuddy",
   chatBase: "https://copilot.tencent.com",
   billingBase: "https://www.codebuddy.cn",
   region: "cn",
   env: "WORKBUDDY_AUTH_FILE",
   desktopFilename: "workbuddy-desktop.info",
-  ownFilename: ".workbuddy-auth.json",
+  ownFilename: ".workbuddy-cn-auth.json",
   catalog: "v3-config",
   electronPath: "/Applications/WorkBuddy.app/Contents/MacOS/Electron",
   electronEnv: "WORKBUDDY_ELECTRON_BIN",

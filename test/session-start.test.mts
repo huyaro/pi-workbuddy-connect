@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 const authDir = join(tmpdir(), `workbuddy-session-start-${process.pid}`);
 await mkdir(authDir, { recursive: true });
-await writeFile(join(authDir, ".workbuddy-auth.json"), JSON.stringify({
+await writeFile(join(authDir, ".workbuddy-cn-auth.json"), JSON.stringify({
   version: 1,
   credential: {
     accessToken: "test-token",
@@ -32,7 +32,7 @@ if (!start) throw new Error("no session_start handler");
 
 const ui = { setWidget() {}, setStatus() {}, notify() {} };
 const result = await Promise.race([
-  start({}, { model: { provider: "workbuddy" }, ui }),
+  start({}, { model: { provider: "workbuddy-cn" }, ui }),
   new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol.for("timed-out")), 100)),
 ]);
 globalThis.fetch = originalFetch;

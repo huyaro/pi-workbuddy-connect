@@ -11,6 +11,11 @@
   ],
   "license": "MIT",
   "type": "module",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": [
       "./extensions"

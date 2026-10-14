@@ -174,10 +174,10 @@ export function ownPathFor(variant: WorkBuddyVariant, agentDir: string): string 
 /**
  * 历史遗留的自留副本文件名。
  *
- * 本插件此前的唯一 provider 是国际版，却把凭据存在 `.workbuddy-auth.json`；
- * 现在国内版占了 `workbuddy`，`.workbuddy-auth.json` 按变体约定属于国内版。
- * 若不迁移，改名后国际版用户会发现自己"未登录"。所以国际版读取时也回退到
- * 这个旧文件名，且优先用新文件。
+ * 本插件此前的唯一 provider 是国际版，却把凭据存在 `.workbuddy-auth.json`。
+ * 国内版改用 `workbuddy-cn` 后，该文件已经不再被任何变体的 `ownFilename`
+ * 占用，所以它纯粹是国际版的历史名：国际版读取时回退到它，优先用新文件。
+ * 国内版与它无关，不得把它当作自家副本。
  */
 const LEGACY_AI_OWN_FILENAME = ".workbuddy-auth.json";
 
