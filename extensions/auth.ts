@@ -186,7 +186,7 @@ export interface CredentialStoreOptions {
   /** pi agent 目录，决定自留副本位置。 */
   agentDir: string;
   /** 执行上游 token 续期。 */
-  refresh: (cred: Cred) => Promise<Cred>;
+  refresh: (cred: Cred, signal?: AbortSignal) => Promise<Cred>;
   /** 提前多久续期；默认五分钟。 */
   refreshMarginMs?: number;
   /** 解密 helper 的注入点，测试不必外启真实二进制。 */
@@ -281,6 +281,40 @@ export class WorkBuddyCredentialStore {
     return own.expiresAtMs > desktop.expiresAtMs ? own : desktop;
   }
 
+  /**
+   * 凭据的"可见性"，用来判断这一版该不该出现。只读本地，**绝不联网**。
+   *
+   * 三种结果，区别很重要：
+   * - `ok`：读出了一份可用凭据。
+   * - `unreadable`：**有**凭据文件，但读不出来（5.6 的加密文档打不开，通常是解密
+   *   helper 起不来）。这**不是**未登录——桌面 App 明明登录着，只是本机解不开。
+   *   把它当成未登录会让一整组模型凭空消失（`WORKBUDDY_ELECTRON_BIN` 指错时 100%
+   *   复现），用户看到的是"插件坏了但没有任何提示"。
+   * - `absent`：压根没有凭据，才是真的未登录。
+   *
+   * 与 `resolve()` 的分工：这里只回答"有没有"，不回答"能不能续期"。续期是网络操作
+   * （30s 超时），混进来会把启动拖慢（实测 token 过期 + 网络不可达时 `pi` 从 2.9s
+   * 变成 60s），也会把"刷不了"误判成"没登录"。
+   */
+  async credentialPresence(): Promise<"ok" | "unreadable" | "absent"> {
+    if (await this.current()) return "ok";
+    for (const path of desktopCandidatesFor(this.variant)) {
+      const text = await readText(path);
+      if (text === undefined) continue;
+      const classified = classifyDesktopAuthDocument(text);
+      if (classified.format === "encrypted") return "unreadable";
+      if (classified.format === "plaintext") {
+        const cred = parseWorkBuddyAuth(text, "desktop");
+        if (cred && credentialMatchesVariant(cred.domain, this.variant)) return "ok";
+      }
+    }
+    // 插件自留副本还在（哪怕解析不了）也算"有凭据"。
+    for (const path of this.ownPaths()) {
+      if (await readText(path) !== undefined) return "unreadable";
+    }
+    return "absent";
+  }
+
   /** 把凭据写进自留副本（仅插件自有的那份）。 */
   async save(cred: Cred): Promise<void> {
     const path = ownPathFor(this.variant, this.agentDir);
@@ -296,8 +330,12 @@ export class WorkBuddyCredentialStore {
 
   /**
    * 解析出一个可用凭据，必要时续期。无凭据时抛错，错误文案带变体名与登录入口。
+   *
+   * `signal` 是调用方的截止信号。续期是网络操作，必须能被调用方取消：启动预算
+   * 只有 2.5s，而续期自身超时是 30s，不并进来的话"token 过期 + 网络只连不通"
+   * 会把启动卡满 30s（实测 30.2s）。
    */
-  async resolve(): Promise<Cred> {
+  async resolve(signal?: AbortSignal): Promise<Cred> {
     const cred = await this.current();
     if (!cred) {
       throw new Error(
@@ -311,9 +349,13 @@ export class WorkBuddyCredentialStore {
       if (cred.expiresAtMs > Date.now() + 30_000) return cred;
       throw new Error(`workbuddy: ${this.variant.displayName} access token 已过期；请在桌面 App 重新登录`);
     }
+    // 并发合并：同一份凭据只续期一次。但**不跨调用方共用信号**——若把第一个
+    // 调用方的 signal 存进来，别的调用方（乃至后续不同预算的调用）就会莫名其妙
+    // 被第一个的截止时间取消。所以只在"当前没有飞行中的续期"时用本次的 signal
+    // 启动，后来者复用同一个 Promise（其截止由发起者决定）。
     this.inflight ??= (async () => {
       try {
-        const next = await this.refresh(cred);
+        const next = await this.refresh(cred, signal);
         await this.save(next);
         return next;
       } catch (error) {

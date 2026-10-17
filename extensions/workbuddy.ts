@@ -22,6 +22,26 @@ import { AI_VARIANT, CN_VARIANT, VARIANTS, regionOf, type WorkBuddyVariant } fro
 
 /** 每版请求打上的标记头；`before_provider_headers` 靠它认领自己的请求。 */
 const MARKER = "X-Pi-WorkBuddy";
+/**
+ * 注册闸门用的占位 apiKey，**不是**凭据。
+ *
+ * pi 只有在 provider 声明了 `apiKey` 或 `oauth` 时才认为它"已配置"
+ * （`composeApiKeyAuth` 的 `check` 在没有 `rawKey` 时返回 undefined），而
+ * 未配置的 provider 会被整组从可用模型快照里剔除——模型选择器与
+ * `--list-models` 读的都是这份快照。所以没有这一项，两版注册得再对也永远
+ * 不显示：这正是"重启后只剩腾讯云"的成因。
+ *
+ * 真 token 由 `before_provider_headers` 写进 `event.headers`（即 pi 传给底层
+ * openai 客户端的 `model.headers`），**靠合并顺序**压过这里生成的
+ * `Authorization: Bearer <占位值>`——openai SDK 的 `buildHeaders` 把
+ * `defaultHeaders` 排在 `authHeaders(apiKey)` 之后。这是顺序依赖，不是"钩子
+ * 一定赢"的契约：将来 SDK 调整合并顺序，占位值就可能真的发出去。
+ *
+ * 所以这个值刻意取得一眼可辨（绝不是合法 token）：真发出去必然 401，属于
+ * fail-closed，而不是静默用错身份。已实测确认（本地 echo server + 抓真实
+ * 请求）：钩子认领时线上是 `Bearer <真 token>`，钩子未认领时才会看到这个占位值。
+ */
+const REGISTRATION_API_KEY = "workbuddy-desktop-credential";
 /** 产品配置缓存 env（国际版）。 */
 const PRODUCT_CONFIG_ENV = "WORKBUDDYAI_PRODUCT_CONFIG";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -74,6 +94,25 @@ type ProductConfig = { source: "cache" | "builtin"; models: ProductModel[] };
 // ponytail: flash reasoning loops (OK/Let me write/Go) eat 128k max_tokens; 16k stops the stall. Raise if long answers get cut.
 const FLASH_MAX_TOKENS = 16_384;
 
+/**
+ * 兜底误列的模型 id：在 App 侧目录里出现，但**上游不提供**。
+ *
+ * 注意判据是"上游认不认"，不是"CLI 名单里有没有"。这里踩过一次坑，记下来：
+ *
+ * - 桌面 App 的产品配置（`acc-product-config-v3.json`）与 `/v3/config` CLI 名单
+ *   确实是两份名单（网关按 UA 分流），但**名单之差 ≠ 可用性之差**。曾据"CLI 名单
+ *   里没有 `hy4-preview-f`"断定它不可用并把它剔除，实测是错的：
+ *   `POST /v2/chat/completions {model:"hy4-preview-f"}` 返回 **200**，它是个能用的
+ *   免费模型。凭"不在 CLI 名单里"删模型，等于凭空没收一个可用档位。
+ *
+ * - 真正不可用的是这两个付费档：`gpt-5.6-sol`(x3.47)、`gpt-6-astra`(x6.67)，
+ *   请求返回 400 `model [...] service info not found`（与乱造 id 的报错一致）。
+ *   它们只出现在 App 侧兜底清单里，选中必然失败，所以从兜底里剔除。
+ *
+ * 实时目录是权威的，这里只管离线兜底；上游将来上/下架某个 id 时，改这一处即可。
+ */
+const UNSERVABLE_FALLBACK_IDS: ReadonlySet<string> = new Set(["gpt-5.6-sol", "gpt-6-astra"]);
+
 const BUILTIN_MODELS: ProductModel[] = [
   {
     id: "deepseek-v4.1-flash",
@@ -110,10 +149,125 @@ const BUILTIN_MODELS: ProductModel[] = [
   },
 ];
 
+// 兜底清单里的免费 id。
 const FREE_IDS = ["hy3", "deepseek-v4.1-flash", "hy4-preview-f"] as const;
+
+/**
+ * 国内版的最小兜底清单：它实测能用的两个免费档。
+ *
+ * 国内版原本**没有任何离线兜底**——拉不到就是空清单、整组隐藏。设计的初衷是
+ * "宁可隐藏也不要给一份选了必然报错的列表"，但当网络只是**慢**而不是断的时候，
+ * 代价是灾难性的：`pi` 的启动快照只等一次有界尝试（2.5s），慢于此就永久看不到
+ * 国内版任何模型，连目录缓存都写不出来，下一次启动还是空的——**永远不会自愈**。
+ *
+ * 所以给一份最小但**实测可用**的清单：两个免费档的 id/窗口与实时目录一致（实时
+ * 拉取成功后会被真实名单整体替换）。它们是"兜底"，不是"猜测"：上游若哪天撤掉，
+ * 表现是选中报错，而不是静默用错模型。
+ */
+const CN_BUILTIN_MODELS: ProductModel[] = [
+  {
+    id: "hy3",
+    name: "Hy3",
+    credits: "x0.00",
+    contextWindow: 192_000,
+    maxTokens: 64_000,
+    supportsImages: true,
+    supportsReasoning: true,
+    supportedEfforts: ["low", "high"],
+    canDisableThinking: false,
+  },
+  {
+    id: "step-5-preview",
+    name: "Step-5-Preview",
+    credits: "x0.00",
+    contextWindow: 1_000_000,
+    maxTokens: 64_000,
+    supportsImages: true,
+    supportsReasoning: true,
+    supportedEfforts: ["low", "medium", "high"],
+    canDisableThinking: false,
+  },
+];
 
 function agentDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+/**
+ * 实时目录落盘缓存（两版各一份）。
+ *
+ * 注册那一刻的清单决定"这次启动能看到什么"。国内版没有任何离线兜底，国际版只有
+ * 产品配置缓存/内置清单——两者都不等于上游当前真正下发的名单。于是同一份账号、
+ * 同一份目录，重启几次会看到不同的免费模型集合（实测：国际版 12 次里有 1 次多出
+ * `hy4-preview-f`，那是只有兜底清单才有的条目；国内版更严重，会整个分组消失）。
+ *
+ * 把最近一次成功拉到的目录存下来，下次启动先用它注册，实时拉取成功后再覆盖。
+ * 缓存只是同一份答案的上一次快照，不改变语义；拉取失败时卡片会标「已保存」而不是
+ * 「实时」，来源依然可见。目录不含凭据（只有模型名与窗口），所以与 token 分开存。
+ */
+function catalogCachePath(variant: WorkBuddyVariant): string {
+  return join(agentDir(), `.workbuddy-catalog-${variant.region}.json`);
+}
+
+/** 落盘缓存的结构；读取器拒绝其他版本。 */
+const CATALOG_CACHE_VERSION = 1;
+
+export function parseCatalogCache(text: string): UpstreamModel[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const document = parsed as Record<string, unknown>;
+  if (document["version"] !== CATALOG_CACHE_VERSION) return undefined;
+  if (!Array.isArray(document["models"])) return undefined;
+  const models: UpstreamModel[] = [];
+  for (const raw of document["models"]) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+    const row = raw as Record<string, unknown>;
+    const id = typeof row["id"] === "string" ? row["id"] : "";
+    const contextWindow = typeof row["contextWindow"] === "number" ? row["contextWindow"] : 0;
+    const maxTokens = typeof row["maxTokens"] === "number" ? row["maxTokens"] : 0;
+    if (id === "" || contextWindow <= 0 || maxTokens <= 0) continue;
+    // 旧版本可能把上游不提供的条目写进过缓存；读的时候同样要剔。
+    if (UNSERVABLE_FALLBACK_IDS.has(id)) continue;
+    const supportedEfforts = Array.isArray(row["supportedEfforts"])
+      ? row["supportedEfforts"].filter((e): e is string => typeof e === "string")
+      : undefined;
+    models.push({
+      id,
+      name: typeof row["name"] === "string" && row["name"] !== "" ? row["name"] : id,
+      contextWindow,
+      maxTokens,
+      supportsImages: row["supportsImages"] === true,
+      supportsReasoning: row["supportsReasoning"] === true,
+      ...supportedEfforts === undefined || supportedEfforts.length === 0 ? {} : { supportedEfforts },
+      canDisableThinking: row["canDisableThinking"] === true,
+      ...typeof row["credits"] === "string" && row["credits"] !== "" ? { credits: row["credits"] } : {},
+      free: row["free"] === true,
+    });
+  }
+  return models.length > 0 ? models : undefined;
+}
+
+function loadCatalogCache(variant: WorkBuddyVariant): UpstreamModel[] | undefined {
+  try {
+    return parseCatalogCache(readFileSync(catalogCachePath(variant), "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+async function saveCatalogCache(variant: WorkBuddyVariant, models: readonly UpstreamModel[]): Promise<void> {
+  try {
+    await writeFile(
+      catalogCachePath(variant),
+      `${JSON.stringify({ version: CATALOG_CACHE_VERSION, models })}\n`,
+      { mode: 0o600 },
+    );
+  } catch { /* 缓存写不进去不该影响任何别的事 */ }
 }
 
 function productConfigPath(): string {
@@ -126,6 +280,21 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+/**
+ * `PI_OFFLINE` 是否表示"真的离线"。
+ *
+ * 必须与 pi 自己的判定一致（`isTruthyEnvFlag`：`1` / `true` / `yes`，大小写不敏感）。
+ * 把任意非空值都当离线会出事：`PI_OFFLINE=0` 时 pi 照常联网、插件却拒绝拉取，
+ * 国内版在干净目录里会**永远**是空的、还写不出缓存；而 pi 自己用的是"真值"语义，
+ * 两者不一致就成了一个静默的坏状态。
+ *
+ * `pi --offline` 会把 `PI_OFFLINE` 设成 `"1"`，所以那条路径同样被这里认到。
+ */
+export function offlineRequested(value: string | undefined): boolean {
+  if (!value) return false;
+  return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
 function positiveNumber(value: unknown): number | undefined {
@@ -174,15 +343,33 @@ export function parseProductConfig(text: string): ProductConfig | undefined {
   if (!document || !Array.isArray(document.models)) return undefined;
   const models = document.models.map(parseProductModel).filter((m): m is ProductModel => m !== undefined);
   if (models.length === 0) return undefined;
-  return { source: "cache", models };
+  // 在这里就滤掉上游不提供的档位，而不是留给调用方：漏一步就会把必然 400 的
+  // 模型列进兜底清单。过滤只针对 App 侧产品配置（`withoutUnservableModels`
+  // 的说明解释了为什么判据必须是"实测不可用"）。
+  return { source: "cache", models: withoutUnservableModels(models) };
 }
 
 export function loadProductConfig(path = productConfigPath()): ProductConfig {
   try {
+    // parseProductConfig 已经在解析处滤掉不可用档位，这里不用再滤一遍。
     const parsed = parseProductConfig(readFileSync(path, "utf8"));
     if (parsed) return parsed;
   } catch { /* missing/unreadable cache → builtin */ }
   return { source: "builtin", models: BUILTIN_MODELS };
+}
+
+/**
+ * 剔除上游不提供的兜底模型行（见 UNSERVABLE_FALLBACK_IDS）。
+ *
+ * App 侧产品配置列了若干上游其实不提供的档位（实测请求返回 400
+ * `model [...] service info not found`）。它们在**唯一**的入口处被过滤，
+ * 这样兜底清单从哪个分支来都不会带出必然失败的选项。
+ *
+ * 注意：这里**只**剔除实测不可用的 id。不要按"不在 CLI 名单里"来删——
+ * `hy4-preview-f` 就不在 CLI 名单里却完全可用。
+ */
+export function withoutUnservableModels(models: readonly ProductModel[]): ProductModel[] {
+  return models.filter((model) => !UNSERVABLE_FALLBACK_IDS.has(model.id));
 }
 
 /** 国际版兜底清单，按 credits 是否为 0 判免费。 */
@@ -370,6 +557,17 @@ class VariantRuntime {
   private catalogSource = "内置兜底";
   /** 最近一次成功刷新到的实时目录，供离线降级。 */
   private liveCatalog: UpstreamModel[] | undefined;
+  /** 飞行中的目录拉取；并发调用合并到同一个请求上。 */
+  private inflightRefresh: Promise<boolean> | undefined;
+  /**
+   * 当前清单是否"权威"——即来自落盘缓存或实时拉取，而不是离线兜底清单。
+   *
+   * 这是启动时该不该等这次网络的分界线。兜底清单（国际版的产品配置/内置）不等于
+   * 上游现在真正下发的名单：它多出只有自己才有的条目（`hy4-preview-f`），一被
+   * 注册出去就会让"免费模型集合"在重启之间变化。所以清单只要还是兜底来的，
+   * 启动就该等一次实时结果（有界）。
+   */
+  private catalogAuthoritative = false;
   private card: string[] | undefined;
 
   constructor(variant: WorkBuddyVariant) {
@@ -379,13 +577,25 @@ class VariantRuntime {
     this.store = new WorkBuddyCredentialStore({
       variant,
       agentDir: agentDir(),
-      refresh: (cred) => this.upstream.refreshAccess(cred),
+      refresh: (cred, signal) => this.upstream.refreshAccess(cred, signal),
     });
     this.applyFallback();
   }
 
   /** 装载兜底目录：国际版用产品配置缓存，国内版无兜底（隐藏分组）。 */
   private applyFallback(): void {
+    // 两版都优先用"上次实时拉到的目录"：它记的是上游真正下发的名单，比任何
+    // 离线兜底都准。留这一层是为了让注册那一刻的清单与上游一致——否则同一份
+    // 账号、同一份目录，重启几次会看到不同的免费模型集合（实测国际版 12 次里
+    // 有 1 次多出 hy4-preview-f，那是兜底清单才有的条目）。
+    const cached = loadCatalogCache(this.variant);
+    if (cached) {
+      this.models = cached;
+      this.liveCatalog = cached;
+      this.catalogSource = "已保存";
+      this.catalogAuthoritative = true;
+      return;
+    }
     if (this.variant.catalog === "product-config") {
       const config = loadProductConfig();
       this.models = config.source === "cache"
@@ -403,12 +613,27 @@ class VariantRuntime {
         }))
         : builtinAsUpstream();
       this.catalogSource = config.source === "cache" ? "产品配置缓存" : "内置兜底";
+      // 兜底清单不是权威名单，所以这一版启动时仍要等一次实时拉取。
+      this.catalogAuthoritative = false;
       return;
     }
-    // 国内版没有离线兜底：目录只来自 `/v3/config`，拉不到就先空着，
-    // 由 refreshCatalog 填充。
-    this.models = [];
-    this.catalogSource = "尚未拉取";
+    // 国内版用最小兜底清单（见 CN_BUILTIN_MODELS），**不再留空**：
+    // 留空会让"网络慢于 2.5s"变成"永久看不到国内版"，且无法自愈。
+    // 仍然是"兜底"语义——实时拉取成功后会整体替换，卡片上标明来源是"内置兜底"。
+    this.models = CN_BUILTIN_MODELS.map((model) => ({
+      id: model.id,
+      name: model.name,
+      contextWindow: model.contextWindow,
+      maxTokens: model.maxTokens,
+      supportsImages: model.supportsImages,
+      supportsReasoning: model.supportsReasoning,
+      ...model.supportedEfforts ? { supportedEfforts: [...model.supportedEfforts] } : {},
+      canDisableThinking: model.canDisableThinking,
+      ...model.credits === undefined ? {} : { credits: model.credits },
+      free: creditsAreFree(model.credits),
+    }));
+    this.catalogSource = "内置兜底";
+    this.catalogAuthoritative = false;
   }
 
   get credentials(): WorkBuddyCredentialStore {
@@ -424,47 +649,106 @@ class VariantRuntime {
     return this.catalogSource;
   }
 
+  /** 清单是否来自缓存或实时拉取（而不是离线兜底）。 */
+  get authoritative(): boolean {
+    return this.catalogAuthoritative;
+  }
+
   /**
    * 拉取实时目录；失败时保留现有清单并返回 false。
    *
    * 国内版首次拉取失败时清单仍为空——没凭据就整组隐藏，比给出一份选了必然
    * 报错的兜底列表要好。
+   *
+   * 并发调用合并成一次飞行请求：启动时插件自己会拉、pi 的 `refreshModels` 也会
+   * 拉，两处撞在一起没必要打两个一模一样的上游请求。
+   *
+   * `signal` 用于给"启动时那次有界等待"设截止时间。**必须传**：上游超时是 30s，
+   * 而工厂函数会被 pi await，不主动中止就会让启动陪着一次不可达的网络干等 30s。
    */
-  async refreshCatalog(): Promise<boolean> {
+  async refreshCatalog(signal?: AbortSignal): Promise<boolean> {
+    this.inflightRefresh ??= this.doRefreshCatalog(signal).finally(() => {
+      this.inflightRefresh = undefined;
+    });
+    return await this.inflightRefresh;
+  }
+
+  private async doRefreshCatalog(signal?: AbortSignal): Promise<boolean> {
     let cred: Cred;
     try {
-      cred = await this.store.resolve();
+      // 把截止信号传进 resolve：续期是网络操作（上游 30s 超时），不接信号的话
+      // "token 过期 + 网络只连不通"会让启动卡满 30s，预算形同虚设。
+      cred = await this.store.resolve(signal);
     } catch {
-      // 未登录：国内版与没兜底的国际版都清空，保证分组隐藏。
-      if (this.variant.catalog === "v3-config") {
-        this.models = [];
-        this.catalogSource = "未登录";
+      // 取不到凭据。分两种情况，不能一律当"未登录"处理：
+      // - 确实没登录（本地就读不到凭据）→ 清空清单，分组隐藏。
+      // - 有凭据但这次解析失败（续期失败、解密 helper 起不来）→ **保留/恢复**清单。
+      //   把它当成未登录会让"读得到但刷不了"的一整组模型凭空消失，正是老症状
+      //   （例如 WORKBUDDY_ELECTRON_BIN 指错时 100% 复现）。
+      //
+      // 注意"恢复"这半边是必须的：`logout` 会把 models 清空，之后用户重新登录时
+      // `resolve()` 仍可能先失败一次（token 还没刷新）。只"保留"就会把空清单一直
+      // 留着——状态写着"已登录"、模型却是 0 个。
+      if (await this.store.credentialPresence() !== "absent") {
+        if (this.models.length === 0) {
+          this.applyFallback();
+          this.catalogSource = "内置兜底";
+        }
+        return false;
       }
+      this.models = [];
+      this.catalogSource = "未登录";
       return false;
     }
-    try {
-      const models = await this.upstream.fetchModels(cred);
-      this.liveCatalog = models;
-      this.models = models;
-      this.catalogSource = "实时";
-      return true;
-    } catch {
+    // `PI_OFFLINE=1`（或 `pi --offline`）是用户/CI 明确要求的"别联网"，插件自己
+    // 发起的这次拉取必须同样遵守，否则 --offline 只挡住了 pi 的刷新、挡不住插件。
+    // 判定与 pi 一致（见 offlineRequested），`PI_OFFLINE=0` 不算离线。
+    // 已有缓存就继续用它，没有就保持现状。
+    if (offlineRequested(process.env.PI_OFFLINE)) {
       if (this.liveCatalog) {
         this.models = this.liveCatalog;
         this.catalogSource = "已保存";
       }
       return false;
     }
-  }
-
-  /** 是否有可用凭据（决定分组是否显示）。 */
-  async signedIn(): Promise<boolean> {
     try {
-      await this.store.resolve();
+      const models = await this.upstream.fetchModels(cred, signal);
+      this.liveCatalog = models;
+      this.models = models;
+      this.catalogSource = "实时";
+      this.catalogAuthoritative = true;
+      // 两版都存：这是上游真正下发的名单，下次启动先用它注册，才能保证
+      // "重启后看到的免费模型集合"与上次一致。
+      await saveCatalogCache(this.variant, models);
       return true;
     } catch {
+      // 中止（预算到点）与失败走同一条路：保留现有清单，别把已经注册好的清单抹掉。
+      if (this.liveCatalog) {
+        this.models = this.liveCatalog;
+        this.catalogSource = "已保存";
+      } else if (this.models.length === 0) {
+        // 手上什么都没有：装回兜底清单。否则这个变体就永久停在"已登录但 0 个模型"
+        // ——`logout` 清空之后重新登录、或者首拉就失败时都会踩到（老症状）。
+        this.applyFallback();
+      }
       return false;
     }
+  }
+
+  /**
+   * 这一版该不该出现在模型列表里。
+   *
+   * **只读本地，绝不联网**（见 `credentialPresence`）。两种"看不到"要分开：
+   * - `absent`：真的没登录 → 隐藏。
+   * - `unreadable`：桌面 App 登录着，只是本机解不开（解密 helper 起不来等）
+   *   → **仍然显示**。这种情况下列表里至少还有兜底清单能用来诊断；藏起来只会让
+   *   用户看到"插件莫名其妙坏了"，连 `--list-models` 都查不出这一版存在。
+   *
+   * 早先用 `resolve()` 判定会把"能不能续期"混进来：token 过期 + 网络不可达时启动
+   * 被拖到 60s；helper 坏掉时已登录用户被误判成未登录、整组消失。
+   */
+  async signedIn(): Promise<boolean> {
+    return await this.store.credentialPresence() !== "absent";
   }
 
   /** 取凭据，失败时抛出可展示错误。 */
@@ -509,30 +793,62 @@ export default async function (pi: ExtensionAPI) {
   /** 各版当前注册的 pi 模型，供卡片渲染。 */
   const registered = new Map<string, { name: string }[]>();
 
+  /**
+   * 各版是否已登录（有可用凭据）。
+   *
+   * 这是"分组是否出现"的**唯一**判据——不是"清单空不空"，也不是"拉取成没成功"。
+   * 早先靠"拉取失败就把清单清空"来隐藏分组，那在"有兜底清单 + 离线（跳过等待）"
+   * 的组合下会漏：注册时用的是兜底清单，而没有任何一次拉取去清它，于是未登录也
+   * 会列出模型。改成显式按凭据判断，兜底清单怎么变都不会误显示。
+   */
+  const signedIn = new Map<string, boolean>();
+
   function recompute(variant: WorkBuddyVariant): {
     models: ReturnType<typeof buildPiModels>;
     names: { name: string }[];
   } {
     const runtime = byId.get(variant.id)!;
+    // 未登录：一个模型都不注册（整组隐藏）。启动时这个值一定已经判定过
+    // （工厂里先 await signedIn() 再 apply）；尚未判定时按放行处理，由随后的
+    // apply() 落定，这样已登录用户不会因为顺序问题看不到模型。
+    if (signedIn.get(variant.id) === false) return { models: [], names: [] };
     const models = buildPiModels(runtime.catalog, scope);
     return { models, names: models.map((model) => ({ name: model.name })) };
   }
+
+  /**
+   * 各版上次注册时的模型签名。
+   *
+   * `apply()` 会在启动、目录刷新后、切换 scope 后各跑一次；每跑一次都重新
+   * `registerProvider` 一遍，pi 那边要重新组装 provider、重建模型快照，而内容
+   * 往往一模一样（启动时刚注册完，刷新又拿回同一份目录）。签名没变就跳过，
+   * 只把真正变化的版本重注册一遍。
+   */
+  const appliedSignature = new Map<string, string>();
 
   function apply(next?: Scope) {
     if (next) scope = next;
     for (const runtime of runtimes) {
       const { models, names } = recompute(runtime.variant);
+      const signature = JSON.stringify([scope, models.map((model) => [model.id, model.name, model.maxTokens])]);
+      if (appliedSignature.get(runtime.variant.id) === signature) continue;
+      appliedSignature.set(runtime.variant.id, signature);
       modelIds.set(runtime.variant.id, new Set(models.map((model) => model.id)));
       registered.set(runtime.variant.id, names);
       pi.registerProvider(runtime.variant.id, {
         name: runtime.variant.displayName,
         baseUrl: `${runtime.variant.billingBase}/v2`,
         api: "openai-completions",
+        // 见 REGISTRATION_API_KEY：这是"让 pi 认这个 provider 已配置"的闸门，
+        // 不是凭据。真 token 由 before_provider_headers 注入并覆盖它。
+        apiKey: REGISTRATION_API_KEY,
         headers: { [MARKER]: runtime.variant.id },
         models,
-        async refreshModels() {
+        async refreshModels(ctx: { signal?: AbortSignal } | undefined) {
           scope = loadSettings().scope;
-          await runtime.refreshCatalog();
+          // 必须把 pi 给的 signal 传下去：否则这里的拉取会一直挂到上游自己的 30s
+          // 超时，而 pi 只等 15s —— 网络不可达时整个启动就陪着卡 15s 以上。
+          await runtime.refreshCatalog(ctx?.signal);
           const next = recompute(runtime.variant);
           modelIds.set(runtime.variant.id, new Set(next.models.map((model) => model.id)));
           registered.set(runtime.variant.id, next.names);
@@ -542,14 +858,110 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * 首次注册前，先给"还没有权威清单"的那版一次有界机会。
+   *
+   * 注册那一刻的清单会被 pi 立刻抓进可用模型快照。早先的写法是"先注册兜底、再等、
+   * 等完重注册"，于是存在一段窗口：几毫秒时快照里是兜底集合，几百毫秒后被实时集合
+   * 覆盖——任何落在窗口里的观察点都会看到一个随后消失的模型。改成"先等再注册"就
+   * 消掉了那个窗口：只会注册一次。
+   *
+   * 判据是"清单是否权威"（来自缓存或实时），不是"清单空不空"：
+   * - 有落盘缓存 → 已是上次上游真正下发的名单，不必等。
+   * - 没登录 → 读凭据就失败、不发请求，立刻返回。
+   * - 只有兜底清单 → 等一次实时结果。
+   *
+   * 预算用**计时器**兜底而不是只靠 abort：abort 只对尊重信号的 fetch 有效，任何
+   * 挂死的实现都会让 await 永远挂着、把 pi 的启动一起拖住。计时器保证有界。
+   * （abort 只是尽力让真实 socket 早点结束，别指望它一定会释放——实测过挂死的
+   * socket 能活过工厂返回；真正兜底的是计时器。）
+   *
+   * 边界说明（不要过度承诺）：等到了，首屏就是实时名单；没等到（慢或断网），首屏是
+   * 缓存或兜底清单，**之后**若有一次拉取成功（例如 `session_start` 那次 `refreshAll()`）
+   * 列表还会更新。所以"会话期内列表不再变化"是**不成立的**——目录是动态的，这里只
+   * 保证不再有"注册时先给一份、随后立刻被换掉"的窗口。
+   *
+   * 这里**不能**再挂一个"预算到点后补拉"的后台任务：`pi` 此后很快退出进程（实测
+   * `--list-models` 约 2.8s 就退），补拉来不及；而且那次不带预算的拉取会握着 socket
+   * 不放，把进程拖到 15s 以上（实测）。慢网络下"能不能看到国内版"改由 CN_BUILTIN_MODELS
+   * 兜住，不再依赖这次补拉。
+   */
+  const STARTUP_CATALOG_BUDGET_MS = 2_500;
+
+  /**
+   * 先判定两版是否已登录，再决定注册什么。
+   *
+   * 必须在**选择兜底清单之前**做：兜底清单是给"已登录但拉不到目录"的人用的，
+   * 未登录的人一个模型都不该看到。
+   *
+   * 用 `signedIn()`——它只读本地凭据、**绝不联网**（见 `credentialPresence`）。
+   * 这里若换成 `resolve()`，token 过期 + 网络不可达时会把启动拖到 60s。
+   */
+  await Promise.all(runtimes.map(async (runtime) => {
+    signedIn.set(runtime.variant.id, await runtime.signedIn());
+  }));
+
+  const coldCatalogs = offlineRequested(process.env.PI_OFFLINE)
+    ? []
+    : runtimes.filter((runtime) => !runtime.authoritative);
+  if (coldCatalogs.length > 0) {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve("timeout");
+      }, STARTUP_CATALOG_BUDGET_MS);
+    });
+    try {
+      await Promise.race([
+        Promise.all(coldCatalogs.map(async (runtime) => {
+          await runtime.refreshCatalog(controller.signal);
+        })).then(() => "done" as const, () => "done" as const),
+        budget,
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  // 首屏注册：等到了就是实时名单，没等到就是缓存/兜底清单；未登录的整组为空。
+  // 这里**不能**再挂一个"预算到点后补拉"的后台任务：`pi` 在这之后很快就退出
+  // 进程（实测 `--list-models` 约 2.8s 就退），补拉根本来不及；而那次不带预算的
+  // 拉取会握着 socket 不放，反而把进程拖到 15s 以上（实测）。
   apply();
 
-  /** 后台拉一次两版的目录，然后重注册模型。 */
-  async function refreshAll(): Promise<void> {
-    await Promise.all(runtimes.map(async (runtime) => {
-      await runtime.refreshCatalog();
-    }));
-    apply();
+  /**
+   * 拉一次两版的目录，然后重注册模型。
+   *
+   * 为什么不能只靠 pi 的 `refreshModels`：`pi` 在 refresh 被后续调用取代时会把
+   * `refreshModels` 的返回值整个丢掉（`provider-composer` 里 `context.signal.aborted`
+   * 直接 `return`），并且 `--list-models` 这类一次性命令**根本不发起网络刷新**。
+   * 这里主动拉完并 `apply()` 重注册一次，命中与否不再依赖 pi 的刷新调度。
+   */
+  /**
+   * 拉一次两版的目录，重判登录状态，然后重注册。
+   *
+   * 并发调用合并成同一次（启动时可能与别的路径撞上）；但必须能**再次**调用——
+   * 切换登录状态、`/workbuddy` 刷新之后都要重跑，所以结束后清掉句柄，而不是把
+   * Promise 永久缓存下来。
+   */
+  let refreshAllPromise: Promise<void> | undefined;
+  function refreshAll(): Promise<void> {
+    refreshAllPromise ??= (async () => {
+      await Promise.all(runtimes.map(async (runtime) => {
+        await runtime.refreshCatalog();
+      }));
+      // 目录拉完顺便重判登录：`/workbuddy logout` 之后要把分组撤掉，
+      // 不能等到重启 pi。
+      await Promise.all(runtimes.map(async (runtime) => {
+        signedIn.set(runtime.variant.id, await runtime.signedIn());
+      }));
+      apply();
+    })().finally(() => {
+      refreshAllPromise = undefined;
+    });
+    return refreshAllPromise;
   }
 
   pi.on("before_provider_headers", async (event) => {
@@ -657,42 +1069,53 @@ export default async function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("workbuddy", {
-    description: "WorkBuddy 设置：刷新模型与积分、免费/全部模型、断开登录",
+    description: "WorkBuddy 设置：免费/全部（含付费）模型、刷新、断开登录",
     handler: async (args, ctx) => {
       const cmd = String(args ?? "").trim().toLowerCase();
-      if (cmd === "free" || cmd === "all") {
-        await saveSettings(cmd);
-        apply(cmd);
-        for (const runtime of runtimes) await paint(runtime, ctx, true, true);
-        return;
-      }
-      if (cmd === "logout" || cmd === "disconnect" || cmd === "logout-cn" || cmd === "logout-ai") {
-        const target = cmd.endsWith("-cn")
-          ? byId.get(CN_VARIANT.id)
-          : cmd.endsWith("-ai") ? byId.get(AI_VARIANT.id) : undefined;
+
+      /** 切换模型范围（免费 / 含付费），并给出明确回执。 */
+      const setScope = async (next: Scope) => {
+        await saveSettings(next);
+        apply(next);
+        await refreshAll();
+        const count = runtimes.reduce((sum, runtime) => sum + (registered.get(runtime.variant.id)?.length ?? 0), 0);
+        ctx.ui.notify(
+          next === "all"
+            ? `已列出全部模型（含付费）：两版共 ${count} 个。付费模型会消耗积分，请留意倍率。`
+            : `已只列出免费模型：两版共 ${count} 个。`,
+          "info",
+        );
+      };
+
+      /** 断开登录（可只断开其中一版），并立刻撤下对应的模型分组。 */
+      const logout = async (which?: "cn" | "ai") => {
+        const target = which === "cn" ? byId.get(CN_VARIANT.id) : which === "ai" ? byId.get(AI_VARIANT.id) : undefined;
         if (target) await target.logout();
         else for (const runtime of runtimes) await runtime.logout();
         await refreshAll();
-        for (const runtime of runtimes) await paint(runtime, ctx, true, true);
-        return;
+        ctx.ui.notify(target ? `${target.variant.displayName} 已断开登录。` : "两版均已断开登录。", "info");
+      };
+
+      // 付费开关的显式参数形式；"全部/收费" 与 "免费" 都接受，方便手打。
+      if (cmd === "free" || cmd === "免费") return void await setScope("free");
+      if (cmd === "all" || cmd === "paid" || cmd === "全部" || cmd === "收费") {
+        return void await setScope("all");
       }
-      const pick = await ctx.ui.select("WorkBuddy 设置", [
+      if (cmd === "logout" || cmd === "disconnect" || cmd === "logout-cn" || cmd === "logout-ai") {
+        return void await logout(cmd.endsWith("-cn") ? "cn" : cmd.endsWith("-ai") ? "ai" : undefined);
+      }
+
+      // 无参数：弹菜单。菜单项直接标出当前状态，避免"点了不知道发生了什么"。
+      const paidLabel = scope === "free" ? "列出全部模型（含付费）" : "只列出免费模型";
+      const pick = await ctx.ui.select(`WorkBuddy 设置（当前：${scope === "free" ? "仅免费" : "含付费"}）`, [
         "刷新模型与积分",
-        scope === "free" ? "列出全部模型（含付费）" : "只列出免费模型",
+        paidLabel,
         "断开登录",
       ]);
       if (pick === undefined) return;
-      if (pick.startsWith("列出全部")) {
-        await saveSettings("all");
-        apply("all");
-      } else if (pick.startsWith("只列出")) {
-        await saveSettings("free");
-        apply("free");
-      } else if (pick === "断开登录") {
-        for (const runtime of runtimes) await runtime.logout();
-      } else {
-        await refreshAll();
-      }
+      if (pick === paidLabel) await setScope(scope === "free" ? "all" : "free");
+      else if (pick === "断开登录") await logout();
+      else await refreshAll();
       for (const runtime of runtimes) await paint(runtime, ctx, true, true);
     },
   });
@@ -883,6 +1306,38 @@ if (process.argv.includes("--self-check")) {
   }));
   if (!fromCache) throw new Error("parse config");
   if (freeModelIds(fromCache).length !== 1) throw new Error("free ids");
+  // 兜底里只许剔掉**实测上游不提供**的 id。特别地：`hy4-preview-f` 虽然不在 CLI
+  // 名单里，实测请求返回 200，是个能用的免费模型，绝不能因为"名单里没有"就删掉
+  // ——那等于凭空没收一个可用档位（这个错误犯过一次，所以钉在这里）。
+  const filteredFallback = withoutUnservableModels([
+    { id: "hy4-preview-f", name: "Hy4 preview", credits: "x0.00", contextWindow: 1_000_000, maxTokens: 64_000, supportsImages: true, supportsReasoning: true, canDisableThinking: false },
+    { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", credits: "x3.47", contextWindow: 1_000_000, maxTokens: 64_000, supportsImages: true, supportsReasoning: true, canDisableThinking: false },
+    { id: "gpt-6-astra", name: "GPT-6 Astra", credits: "x6.67", contextWindow: 1_000_000, maxTokens: 64_000, supportsImages: true, supportsReasoning: true, canDisableThinking: false },
+  ]);
+  if (filteredFallback.length !== 1 || filteredFallback[0].id !== "hy4-preview-f") {
+    throw new Error("fallback filtering must drop only unservable ids");
+  }
+  // 可用但"不在 CLI 名单里"的免费模型必须留在兜底清单里。
+  if (!BUILTIN_MODELS.some((model) => model.id === "hy4-preview-f")) {
+    throw new Error("builtin fallback must keep servable hy4-preview-f");
+  }
+  if (BUILTIN_MODELS.some((model) => UNSERVABLE_FALLBACK_IDS.has(model.id))) {
+    throw new Error("builtin list leaks unservable model");
+  }
+  if ((FREE_IDS as readonly string[]).some((id) => UNSERVABLE_FALLBACK_IDS.has(id))) {
+    throw new Error("free id list leaks unservable model");
+  }
+  // 旧版本可能把不可用条目写进过缓存；读取端必须同样剔掉。
+  const staleCache = parseCatalogCache(JSON.stringify({
+    version: 1,
+    models: [
+      { id: "gpt-6-astra", name: "GPT-6 Astra", contextWindow: 1_000_000, maxTokens: 64_000, free: false },
+      { id: "hy3", name: "Hy3", contextWindow: 192_000, maxTokens: 64_000, free: true },
+    ],
+  }));
+  if (staleCache?.length !== 1 || staleCache[0].id !== "hy3") {
+    throw new Error("cache read must drop app-only rows");
+  }
   // widget 渲染。
   const lines = widgetLines({
     variant: AI_VARIANT,
@@ -912,6 +1367,36 @@ if (process.argv.includes("--self-check")) {
   if (regionOf("www.workbuddy.ai") !== "global" || regionOf("x.workbuddy.ai") !== "global") throw new Error("region global");
   if (regionOf("") !== "cn") throw new Error("region empty is cn");
   if (variantsCount() !== 2) throw new Error("two variants");
+  // 国内版必须有非空兜底清单：留空会让"网络慢于预算"变成"永久看不到国内版"，
+  // 且无法自愈（拉不到就写不出缓存，下次启动还是空的）。
+  if (CN_BUILTIN_MODELS.length === 0) throw new Error("CN needs a fallback catalog");
+  if (!CN_BUILTIN_MODELS.some((model) => creditsAreFree(model.credits))) {
+    throw new Error("CN fallback must contain a free model");
+  }
+  // 判"是否登录"必须是**本地**操作，不能联网。用 resolve() 会把"能不能续期"混进来：
+  // token 过期 + 网络不可达时启动被拖到 60s；解密 helper 坏掉时已登录用户被判成
+  // 未登录、整组消失。这里静态钉住方法名，防止有人改回去。
+  if (typeof WorkBuddyCredentialStore.prototype.credentialPresence !== "function") {
+    throw new Error("credential presence must be a local-only probe");
+  }
+  // 目录落盘缓存：写进去的目录必须能原样读回来，否则"已保存"会是空的。
+  const cacheRoundTrip = parseCatalogCache(JSON.stringify({
+    version: 1,
+    models: [{
+      id: "hy3", name: "Hy3", contextWindow: 192_000, maxTokens: 64_000,
+      supportsImages: true, supportsReasoning: true, supportedEfforts: ["low", "high"],
+      canDisableThinking: false, credits: "x0.00", free: true,
+    }],
+  }));
+  if (cacheRoundTrip?.length !== 1 || cacheRoundTrip[0].id !== "hy3" || !cacheRoundTrip[0].free) {
+    throw new Error("catalog cache round-trip");
+  }
+  // 版本不对、结构不对、没有可用行——都必须读不出来，不能拿垃圾当目录。
+  if (parseCatalogCache(JSON.stringify({ version: 2, models: [] })) !== undefined) throw new Error("cache version gate");
+  if (parseCatalogCache("not json") !== undefined) throw new Error("cache bad json");
+  if (parseCatalogCache(JSON.stringify({ version: 1, models: [{ id: "x" }] })) !== undefined) {
+    throw new Error("cache drops rows without windows");
+  }
   console.log("ok");
 }
 

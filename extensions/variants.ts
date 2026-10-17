@@ -37,7 +37,11 @@ export interface WorkBuddyVariant {
 
 /** 国内版。 */
 export const CN_VARIANT: WorkBuddyVariant = {
-  id: "workbuddy-cn",
+  // id 必须排在 `workbuddy-ai` **前面**：pi 的模型列表按 provider id 排序
+  // （`provider.localeCompare`），`workbuddy-cn` 会排在 `workbuddy-ai` 之后，
+  // 看起来就是"国内版被挤到国际版下面"。用 `workbuddy` 前缀即天然靠前。
+  // 注意凭据文件名仍是 `.workbuddy-cn-auth.json`——那与 id 无关，不必跟着改。
+  id: "workbuddy",
   displayName: "WorkBuddy",
   chatBase: "https://copilot.tencent.com",
   billingBase: "https://www.codebuddy.cn",

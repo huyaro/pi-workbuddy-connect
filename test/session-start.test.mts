@@ -32,7 +32,7 @@ if (!start) throw new Error("no session_start handler");
 
 const ui = { setWidget() {}, setStatus() {}, notify() {} };
 const result = await Promise.race([
-  start({}, { model: { provider: "workbuddy-cn" }, ui }),
+  start({}, { model: { provider: "workbuddy" }, ui }),
   new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol.for("timed-out")), 100)),
 ]);
 globalThis.fetch = originalFetch;

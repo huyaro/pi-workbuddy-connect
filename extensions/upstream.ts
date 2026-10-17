@@ -124,8 +124,13 @@ export class WorkBuddyUpstream {
    *
    * 续期接口在两版上是同一个路径，但 base 从变体取：国内版走
    * `www.codebuddy.cn`，国际版走 `www.workbuddy.ai`。
+   *
+   * `signal` 是**调用方**的截止信号（启动预算、pi 的刷新信号）。必须并进来：
+   * 只给上游自己的 30s 超时的话，调用方放弃等待后这个请求还会继续挂着，
+   * 把整个进程的退出一起拖住——实测"token 已过期 + 网络只连不通"时
+   * `pi --list-models` 会卡满 30s（预算 2.5s 形同虚设）。
    */
-  async refreshAccess(cred: Cred): Promise<Cred> {
+  async refreshAccess(cred: Cred, signal?: AbortSignal): Promise<Cred> {
     const response = await this.doFetch(`${this.variant.billingBase}/v2/plugin/auth/token/refresh`, {
       method: "POST",
       headers: {
@@ -138,7 +143,9 @@ export class WorkBuddyUpstream {
         "X-Auth-Refresh-Source": "workbuddy",
         ...cred.enterpriseId ? { "X-Enterprise-Id": cred.enterpriseId } : {},
       },
-      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+      signal: signal === undefined
+        ? AbortSignal.timeout(JSON_TIMEOUT_MS)
+        : AbortSignal.any([signal, AbortSignal.timeout(JSON_TIMEOUT_MS)]),
     });
     const envelope = readEnvelope(await response.json());
     const data = envelope.data;
