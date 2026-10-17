@@ -509,6 +509,29 @@ function bar(remain: number, size: number, width = 28): string {
 /** 低余额警示线：套餐剩余占比低于此百分比时行首标 ⚠。 */
 export const LOW_CREDIT_PCT = 10;
 
+/**
+ * 暗色主题下可读的高亮 ANSI 色。
+ *
+ * widget 行**只在终端 TUI 模式**（`ctx.mode === "tui"`）着色：Pi Desktop（RPC）
+ * 把 widgetLines 当纯文本渲染、不解析转义序列，着色会显示成 `[96m` 之类的乱码。
+ */
+const ANSI = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  cyan: "\x1b[96m",
+  yellow: "\x1b[93m",
+  red: "\x1b[91m",
+  gray: "\x1b[90m",
+} as const;
+
+/** 是否存在低于警示线的积分包；通知据此升级为 warning 级别（桌面端以此变色）。 */
+export function hasLowCredit(credits: Credits): boolean {
+  return credits.accounts.some((pack) => {
+    const pct = packPct(pack);
+    return pct !== undefined && pct < LOW_CREDIT_PCT;
+  });
+}
+
 /** 显示宽度估算：CJK 等全角字符按 2 列，其余按 1 列（等宽字体下的近似）。 */
 function displayWidth(text: string): number {
   let width = 0;
@@ -563,8 +586,13 @@ export function creditsSummary(credits: Credits): string {
 /**
  * 积分明细行：低余额的包排最前（需要关注的先看到），每包带精确数字与百分比，
  * 进度条只作辅助估读。行首缩进两格与卡片其他字段区分层级。
+ *
+ * 行数有硬上限（`maxPacks`，默认 4）：积分包多的账号（实测国内版可达 58 个）
+ * 若全列出来，卡片会高达百余行——pi 终端侧 widget 超 10 行直接截断，桌面端
+ * 面板按行堆叠，观感就是"弹出框巨大"。超出的包合并成一行摘要，点睛信息
+ * （余额最低的几个）永远在前。
  */
-export function creditRows(credits: Credits): string[] {
+export function creditRows(credits: Credits, maxPacks = 4): string[] {
   const rows: string[] = [];
   const packs = [...credits.accounts].sort((a, b) => {
     const pa = packPct(a);
@@ -574,15 +602,22 @@ export function creditRows(credits: Credits): string[] {
     if (pb !== undefined) return 1;
     return 0;
   });
-  for (const pack of packs) {
+  const shown = packs.slice(0, maxPacks);
+  for (const pack of shown) {
     const pct = packPct(pack);
     const flag = pct !== undefined && pct < LOW_CREDIT_PCT ? "⚠ " : "";
     const right = pack.unlimited
       ? "无上限"
       : pct !== undefined ? `${pack.remain}/${pack.size}（${pct}%）` : String(pack.remain);
-    rows.push(`  ${flag}${padEndWidth(pack.packageName, 24)}  ${right}`);
-    const drawn = bar(pack.remain, pack.size, 20);
-    if (drawn) rows.push(`  ${drawn}`);
+    // 进度条并入同一行：包多时行数减半，卡片高度直接减一档。
+    const drawn = bar(pack.remain, pack.size, 14);
+    rows.push(`  ${flag}${padEndWidth(pack.packageName, 24)} ${drawn ? `${drawn} ` : ""}${right}`);
+  }
+  const rest = packs.slice(maxPacks);
+  if (rest.length > 0) {
+    let remain = 0;
+    for (const pack of rest) remain += pack.remain;
+    rows.push(`  … 其余 ${rest.length} 个包 · 余 ${remain}`);
   }
   return rows;
 }
@@ -602,11 +637,21 @@ export function widgetLines(input: {
   catalogSource?: string;
   /** 最近一次成功积分刷新的时间；有则在刷新入口旁标注"更新于"。 */
   refreshedAt?: Date;
+  /** 终端 TUI 模式下用 ANSI 高亮（暗色主题）；桌面端不解析 ANSI，必须保持纯文本。 */
+  color?: boolean;
 }): string[] {
   const scope = input.scope;
+  const c = input.color
+    ? (text: string, code: string) => `${code}${text}${ANSI.reset}`
+    : (text: string) => text;
+  // 账户名上头部：第一行就能对上"这是谁的账号"，不必逐行找。
+  const who = input.cred === undefined ? undefined : (input.cred.nickname || input.cred.uid) || undefined;
   const lines = [
-    `${input.variant.displayName} · ${input.variant.region === "cn" ? "国内版" : "国际版"} `
-    + `· ${scope === "all" ? "全部模型" : "仅免费模型"}`,
+    c(
+      `${input.variant.displayName} · ${input.variant.region === "cn" ? "国内版" : "国际版"} `
+      + `· ${who === undefined ? "" : `${who} · `}${scope === "all" ? "全部模型" : "仅免费模型"}`,
+      ANSI.bold + ANSI.cyan,
+    ),
   ];
   if (!input.cred) {
     lines.push(
@@ -617,19 +662,28 @@ export function widgetLines(input: {
     lines.push("设置  /workbuddy");
     return lines;
   }
-  lines.push(`账号  已登录  ${input.cred.nickname || input.cred.uid}`);
   lines.push(`令牌  ${fmtExpiry(input.cred.expiresAtMs)} 过期（自动续期）`);
   if (input.credits) {
-    lines.push(`积分  ${creditsSummary(input.credits)}`);
-    lines.push(...creditRows(input.credits));
+    // 摘要行加粗；有低余额包时升级为黄色警示。明细里 ⚠ 行红色，其余保持本色。
+    lines.push(
+      c(`积分  ${creditsSummary(input.credits)}`, hasLowCredit(input.credits) ? ANSI.bold + ANSI.yellow : ANSI.bold),
+    );
+    lines.push(...creditRows(input.credits).map((row) => row.includes("⚠") ? c(row, ANSI.red) : row));
   } else if (input.error) {
-    lines.push(`积分  ${input.error}`);
+    lines.push(c(`积分  ${input.error}`, ANSI.yellow));
   }
-  if (input.catalogSource) lines.push(`目录  ${input.catalogSource}`);
-  const names = input.models.map((model) => model.name).join("  |  ") || "（无模型）";
-  lines.push(`模型  ${names}`);
+  if (input.catalogSource) lines.push(c(`目录  ${input.catalogSource}`, ANSI.gray));
+  // 模型清单封顶：全部拼一行会折成一大块（实测国内版 18 个模型），是卡片
+  // 膨胀的另一半原因。完整的清单在模型选择器里本来就能看，这里只提示数量。
+  const allNames = input.models.map((model) => model.name);
+  const names = allNames.length === 0
+    ? "（无模型）"
+    : allNames.length <= 5
+      ? allNames.join("  |  ")
+      : `${allNames.slice(0, 5).join("  |  ")} … 共 ${allNames.length} 个`;
+  lines.push(c(`模型  ${names}`, ANSI.gray));
   const at = input.refreshedAt ? ` · 更新于 ${fmtTime(input.refreshedAt)}` : "";
-  lines.push(`⟳ 刷新积分  /workbuddy c${at} · 设置  /workbuddy`);
+  lines.push(c(`⟳ 刷新积分  /workbuddy c${at} · 设置  /workbuddy`, ANSI.cyan));
   return lines;
 }
 
@@ -1144,7 +1198,7 @@ export default async function (pi: ExtensionAPI) {
    */
   async function paint(
     runtime: VariantRuntime,
-    ctx: { ui: Ui; model?: { provider?: string } },
+    ctx: { ui: Ui; mode?: string; model?: { provider?: string } },
     notify: boolean,
     force = false,
   ): Promise<string[] | undefined> {
@@ -1178,6 +1232,8 @@ export default async function (pi: ExtensionAPI) {
       models: registered.get(runtime.variant.id) ?? [],
       catalogSource: runtime.source,
       refreshedAt: credits === undefined ? undefined : runtime.creditsRefreshedAt(),
+      // ANSI 高亮只在终端 TUI 有效；桌面（RPC）不解析转义序列，必须纯文本。
+      color: ctx.mode === "tui",
     });
     runtime.setCard(lines);
     ctx.ui.setWidget(runtime.widgetKey, lines);
@@ -1190,11 +1246,16 @@ export default async function (pi: ExtensionAPI) {
           : `${runtime.variant.displayName} 已登录`,
     );
     if (notify) {
+      // 弹出通知带上账户名：刷新回执要能一眼对上账号（此前只有积分数字）。
+      // 有低余额包时升级为 warning——桌面端按通知级别配色，比纯文本更醒目。
+      const who = cred === undefined ? "" : ` ${cred.nickname || cred.uid || "已登录"}`;
       ctx.ui.notify(
         error
-          ? `${runtime.variant.displayName}：${error}`
-          : `${runtime.variant.displayName} 已刷新 · 积分 ${credits === undefined ? "?" : creditsSummary(credits)}`,
-        error ? "warning" : "info",
+          ? `${runtime.variant.displayName}${who}：${error}`
+          : credits === undefined
+            ? `${runtime.variant.displayName}${who} 已刷新`
+            : `${who.trim()} · 积分 ${creditsSummary(credits)}`,
+        error || (credits !== undefined && hasLowCredit(credits)) ? "warning" : "info",
       );
     }
     return lines;
@@ -1556,6 +1617,33 @@ if (process.argv.includes("--self-check")) {
   // 无容量信息（size=0）不编造百分比，只报合计。
   const bare = creditsSummary({ total: 123, accounts: [{ packageName: "X", remain: 123, size: 0 }] });
   if (bare !== "合计 123") throw new Error(`credits summary bare: ${bare}`);
+  // 桌面（RPC）路径必须是纯文本：widgetLines 默认不带 ANSI 转义（桌面端不解析，
+  // 着色会变成乱码）。
+  if (lines.some((line) => line.includes("\u001b["))) throw new Error("widget must be plain text by default");
+  // 账户名上头部：第一行就能对上是谁的账号。
+  if (!lines[0]!.includes("user@example.com")) throw new Error("widget header must carry account name");
+  // 终端 TUI 路径：color=true 才着色（暗色主题下用亮色高亮），且每行闭合 reset。
+  const colored = widgetLines({
+    variant: AI_VARIANT,
+    cred: { accessToken: "a", refreshToken: "r", expiresAtMs: 0, domain: "www.workbuddy.ai", uid: "u", nickname: "user@example.com", source: "desktop" },
+    credits: { total: 5, accounts: [{ packageName: "Free", remain: 5, size: 100 }] },
+    scope: "free",
+    models: [],
+    color: true,
+  });
+  if (!colored[0]!.includes("\u001b[1m\u001b[96m")) throw new Error("colored header");
+  if (!colored.some((line) => line.includes("\u001b[91m"))) throw new Error("low-credit rows must be red in TUI");
+  if (colored.some((line) => line.includes("\u001b[") && !line.endsWith("\u001b[0m"))) {
+    throw new Error("every colored line must reset");
+  }
+  // 明细行数有硬上限：积分包多的账号（实测可达 58 个）不能把卡片撑到上百行。
+  const many = creditRows({
+    total: 0,
+    accounts: Array.from({ length: 6 }, (_, i) => ({ packageName: `P${i}`, remain: 1, size: 10 })),
+  });
+  const packRows = many.filter((line) => line.includes("（"));
+  if (packRows.length !== 4) throw new Error(`credit rows must cap at 4 packs, got ${packRows.length}`);
+  if (!many.some((line) => line.includes("其余 2 个包"))) throw new Error("overflow packs must be summarized");
   // 企业无上限的渲染不带数字。
   const unlimited = widgetLines({
     variant: CN_VARIANT,
