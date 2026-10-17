@@ -45,6 +45,8 @@ const REGISTRATION_API_KEY = "workbuddy-desktop-credential";
 /** 产品配置缓存 env（国际版）。 */
 const PRODUCT_CONFIG_ENV = "WORKBUDDYAI_PRODUCT_CONFIG";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+/** 积分短缓存：自动绘制（session_start / model_select）吃缓存，手动刷新强制绕过。 */
+const CREDITS_TTL_MS = 30_000;
 const COMPAT = {
   supportsDeveloperRole: false,
   supportsReasoningEffort: true,
@@ -480,7 +482,13 @@ type Ui = {
   notify(message: string, type?: "info" | "warning" | "error"): void;
 };
 
-/** 卡片归属：只属于真正跑该版模型的会话。 */
+/**
+ * （历史接口）旧版卡片门控：只认 WorkBuddy provider。
+ *
+ * 卡片现在跟随**登录状态**常驻显示（见 `paint`），不再按"会话正用哪个模型"
+ * 撤下——查询积分不该要求先把会话切到 WorkBuddy 模型。此函数保留给外部
+ * 诊断与自检使用。
+ */
 export function showsWorkBuddyCard(provider: unknown, ids: readonly string[], force = false): boolean {
   return force || (typeof provider === "string" && ids.includes(provider));
 }
@@ -498,6 +506,92 @@ function bar(remain: number, size: number, width = 28): string {
   return `${"█".repeat(n)}${"░".repeat(width - n)}`;
 }
 
+/** 低余额警示线：套餐剩余占比低于此百分比时行首标 ⚠。 */
+export const LOW_CREDIT_PCT = 10;
+
+/** 显示宽度估算：CJK 等全角字符按 2 列，其余按 1 列（等宽字体下的近似）。 */
+function displayWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) width += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+  return width;
+}
+
+/** 按显示宽度右侧补空格；超宽不截断（调用方控制总宽度）。 */
+function padEndWidth(text: string, width: number): string {
+  const w = displayWidth(text);
+  return w >= width ? text : text + " ".repeat(width - w);
+}
+
+function packPct(pack: { remain: number; size: number; unlimited?: boolean }): number | undefined {
+  if (pack.unlimited || pack.size <= 0) return undefined;
+  return Math.round(pack.remain / pack.size * 100);
+}
+
+/**
+ * 积分摘要行：有容量就给占比，多包给包数，有低余额包就前置警示计数。
+ *
+ * 例：`合计 358/450（80%）· 2 个包 · ⚠ 1 个偏低`。没有容量信息（size=0）时
+ * 不编造百分比，只报 `合计 <total>`；无上限账号固定 `无上限`——任何渲染路径
+ * 都不出现编造的数字（与 upstream 里「看不懂的答案不能渲染成 0」同一纪律）。
+ */
+export function creditsSummary(credits: Credits): string {
+  if (credits.unlimited) return "无上限";
+  let capacity = 0;
+  let remainOfCapped = 0;
+  let packs = 0;
+  let low = 0;
+  for (const pack of credits.accounts) {
+    if (pack.unlimited) continue;
+    packs += 1;
+    const pct = packPct(pack);
+    if (pct !== undefined) {
+      capacity += pack.size;
+      remainOfCapped += pack.remain;
+      if (pct < LOW_CREDIT_PCT) low += 1;
+    }
+  }
+  const head = capacity > 0
+    ? `合计 ${remainOfCapped}/${capacity}（${Math.round(remainOfCapped / capacity * 100)}%）`
+    : `合计 ${credits.total}`;
+  const tail = [
+    packs > 1 ? `${packs} 个包` : "",
+    low > 0 ? `⚠ ${low} 个偏低` : "",
+  ].filter(Boolean).join(" · ");
+  return tail ? `${head} · ${tail}` : head;
+}
+
+/**
+ * 积分明细行：低余额的包排最前（需要关注的先看到），每包带精确数字与百分比，
+ * 进度条只作辅助估读。行首缩进两格与卡片其他字段区分层级。
+ */
+export function creditRows(credits: Credits): string[] {
+  const rows: string[] = [];
+  const packs = [...credits.accounts].sort((a, b) => {
+    const pa = packPct(a);
+    const pb = packPct(b);
+    if (pa !== undefined && pb !== undefined) return pa - pb;
+    if (pa !== undefined) return -1;
+    if (pb !== undefined) return 1;
+    return 0;
+  });
+  for (const pack of packs) {
+    const pct = packPct(pack);
+    const flag = pct !== undefined && pct < LOW_CREDIT_PCT ? "⚠ " : "";
+    const right = pack.unlimited
+      ? "无上限"
+      : pct !== undefined ? `${pack.remain}/${pack.size}（${pct}%）` : String(pack.remain);
+    rows.push(`  ${flag}${padEndWidth(pack.packageName, 24)}  ${right}`);
+    const drawn = bar(pack.remain, pack.size, 20);
+    if (drawn) rows.push(`  ${drawn}`);
+  }
+  return rows;
+}
+
+function fmtTime(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 export function widgetLines(input: {
   variant: WorkBuddyVariant;
   cred?: Cred;
@@ -506,6 +600,8 @@ export function widgetLines(input: {
   scope: Scope;
   models: { name: string }[];
   catalogSource?: string;
+  /** 最近一次成功积分刷新的时间；有则在刷新入口旁标注"更新于"。 */
+  refreshedAt?: Date;
 }): string[] {
   const scope = input.scope;
   const lines = [
@@ -524,26 +620,16 @@ export function widgetLines(input: {
   lines.push(`账号  已登录  ${input.cred.nickname || input.cred.uid}`);
   lines.push(`令牌  ${fmtExpiry(input.cred.expiresAtMs)} 过期（自动续期）`);
   if (input.credits) {
-    lines.push(
-      input.credits.unlimited
-        ? "积分  无上限"
-        : `积分  合计 ${input.credits.total}`,
-    );
-    for (const pack of input.credits.accounts) {
-      const right = pack.unlimited
-        ? "无上限"
-        : pack.size > 0 ? `${pack.remain} / ${pack.size}` : String(pack.remain);
-      lines.push(`  ${pack.packageName}  剩余 ${right}`);
-      const drawn = bar(pack.remain, pack.size);
-      if (drawn) lines.push(`  ${drawn}`);
-    }
+    lines.push(`积分  ${creditsSummary(input.credits)}`);
+    lines.push(...creditRows(input.credits));
   } else if (input.error) {
     lines.push(`积分  ${input.error}`);
   }
   if (input.catalogSource) lines.push(`目录  ${input.catalogSource}`);
   const names = input.models.map((model) => model.name).join("  |  ") || "（无模型）";
   lines.push(`模型  ${names}`);
-  lines.push("设置  /workbuddy");
+  const at = input.refreshedAt ? ` · 更新于 ${fmtTime(input.refreshedAt)}` : "";
+  lines.push(`⟳ 刷新积分  /workbuddy c${at} · 设置  /workbuddy`);
   return lines;
 }
 
@@ -569,6 +655,10 @@ class VariantRuntime {
    */
   private catalogAuthoritative = false;
   private card: string[] | undefined;
+  /** 积分短缓存与取数时间；undefined = 本会话从未取到过。 */
+  private creditsCache: { credits: Credits; at: number } | undefined;
+  /** 飞行中的积分拉取；并发绘制/刷新合并到同一个请求上。 */
+  private inflightCredits: Promise<Credits> | undefined;
 
   constructor(variant: WorkBuddyVariant) {
     this.variant = variant;
@@ -751,6 +841,11 @@ class VariantRuntime {
     return await this.store.credentialPresence() !== "absent";
   }
 
+  /** 本地判定凭据在不在（绝不联网）；供常驻卡片决定显示/撤下。 */
+  credentialPresence(): Promise<"ok" | "unreadable" | "absent"> {
+    return this.store.credentialPresence();
+  }
+
   /** 取凭据，失败时抛出可展示错误。 */
   async resolveCred(): Promise<Cred> {
     return await this.store.resolve();
@@ -764,9 +859,37 @@ class VariantRuntime {
     return this.card;
   }
 
-  async paintCredits(): Promise<Credits> {
-    const cred = await this.store.resolve();
-    return await this.upstream.fetchCredits(cred);
+  /** 最近一次成功取到积分的时间；供卡片标注「更新于」。 */
+  creditsRefreshedAt(): Date | undefined {
+    return this.creditsCache === undefined ? undefined : new Date(this.creditsCache.at);
+  }
+
+  /**
+   * 取积分：30s 内的自动绘制直接吃缓存（每次读取都是真实计费查询，自动路径
+   * 不该频打上游）；缓存过期或首次调用时拉取。并发调用合并为同一次请求。
+   *
+   * 失败时回退旧缓存（陈旧值仍优于空白）；从未取到过就重新抛出。
+   */
+  async paintCredits(options?: { force?: boolean }): Promise<Credits> {
+    const cached = this.creditsCache;
+    if (!options?.force && cached && Date.now() - cached.at < CREDITS_TTL_MS) {
+      return cached.credits;
+    }
+    this.inflightCredits ??= this.store.resolve()
+      .then((cred) => this.upstream.fetchCredits(cred))
+      .then((credits) => {
+        this.creditsCache = { credits, at: Date.now() };
+        return credits;
+      })
+      .finally(() => {
+        this.inflightCredits = undefined;
+      });
+    try {
+      return await this.inflightCredits;
+    } catch (error) {
+      if (cached) return cached.credits;
+      throw error;
+    }
   }
 
   async logout(): Promise<void> {
@@ -996,40 +1119,45 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // setModel 会 await 本 handler，所以它必须永远不等网络 I/O：
-  // 用缓存的卡片重画，再在后台刷新。
+  // 用缓存的卡片重画，再在后台刷新。卡片已常驻（跟随登录，不跟随模型），
+  // 切到非 WorkBuddy 模型不再撤下账户/积分卡片。
   pi.on("model_select", (_event, ctx) => {
     const provider = ctx.model?.provider;
-    let matched = false;
-    for (const runtime of runtimes) {
-      if (!showsWorkBuddyCard(provider, [...modelIds.keys()])) {
-        runtime.setCard(undefined);
-        ctx.ui.setWidget(runtime.widgetKey, undefined);
-        ctx.ui.setStatus(runtime.widgetKey, undefined);
-        continue;
-      }
-      if (provider !== runtime.variant.id) continue;
-      matched = true;
-      const cached = runtime.cachedCard();
-      if (cached) ctx.ui.setWidget(runtime.widgetKey, cached);
-    }
-    if (!matched) return;
-    const runtime = byId.get(provider as string);
+    if (typeof provider !== "string" || !modelIds.has(provider)) return;
+    const runtime = byId.get(provider);
     if (!runtime) return;
+    const cached = runtime.cachedCard();
+    if (cached) ctx.ui.setWidget(runtime.widgetKey, cached);
     void paint(runtime, ctx, false)
       .then((lines) => runtime.setCard(lines))
       .catch(() => undefined);
   });
 
-  /** 画一张卡片；返回画出的行，隐藏时返回 undefined。 */
+  /**
+   * 画一张卡片（常驻）。
+   *
+   * 显示条件是"这一版已登录"，与会话正用哪个模型无关——查询积分不该要求
+   * 先把会话切到 WorkBuddy 模型。未登录（本地判定，`absent`）的那版撤下
+   * widget 与状态栏；`unreadable` 仍然显示（同 `signedIn` 的语义：藏起来只会
+   * 让用户以为插件坏了）。自动路径（force=false）读 30s 积分短缓存；手动
+   * 刷新（force=true，`/workbuddy c`）绕过 TTL 强制拉取。
+   */
   async function paint(
     runtime: VariantRuntime,
     ctx: { ui: Ui; model?: { provider?: string } },
     notify: boolean,
     force = false,
   ): Promise<string[] | undefined> {
-    const ids = [...modelIds.keys()];
-    if (!showsWorkBuddyCard(ctx.model?.provider, ids, force)) {
-      // 只有当当前会话不在用**任何**一版模型时才隐藏这张卡片。
+    let presence: "ok" | "unreadable" | "absent";
+    try {
+      presence = await runtime.credentialPresence();
+    } catch {
+      presence = "unreadable";
+    }
+    if (presence === "absent") {
+      runtime.setCard(undefined);
+      ctx.ui.setWidget(runtime.widgetKey, undefined);
+      ctx.ui.setStatus(runtime.widgetKey, undefined);
       return undefined;
     }
     let cred: Cred | undefined;
@@ -1037,7 +1165,7 @@ export default async function (pi: ExtensionAPI) {
     let error: string | undefined;
     try {
       cred = await runtime.resolveCred();
-      credits = await runtime.paintCredits();
+      credits = await runtime.paintCredits({ force });
     } catch (caught) {
       error = caught instanceof Error ? caught.message : String(caught);
     }
@@ -1049,19 +1177,23 @@ export default async function (pi: ExtensionAPI) {
       scope,
       models: registered.get(runtime.variant.id) ?? [],
       catalogSource: runtime.source,
+      refreshedAt: credits === undefined ? undefined : runtime.creditsRefreshedAt(),
     });
+    runtime.setCard(lines);
     ctx.ui.setWidget(runtime.widgetKey, lines);
     ctx.ui.setStatus(
       runtime.widgetKey,
-      credits
-        ? `积分 ${credits.unlimited ? "∞" : credits.total}`
-        : cred ? `${runtime.variant.displayName} 已登录` : `${runtime.variant.displayName} 未登录`,
+      error
+        ? `${runtime.variant.displayName} 更新失败`
+        : credits
+          ? `${runtime.variant.displayName} 积分 ${credits.unlimited ? "∞" : credits.total}`
+          : `${runtime.variant.displayName} 已登录`,
     );
     if (notify) {
       ctx.ui.notify(
         error
           ? `${runtime.variant.displayName}：${error}`
-          : `${runtime.variant.displayName} 已刷新 · 积分 ${credits?.unlimited ? "无上限" : credits?.total ?? "?"}`,
+          : `${runtime.variant.displayName} 已刷新 · 积分 ${credits === undefined ? "?" : creditsSummary(credits)}`,
         error ? "warning" : "info",
       );
     }
@@ -1069,9 +1201,33 @@ export default async function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("workbuddy", {
-    description: "WorkBuddy 设置：免费/全部（含付费）模型、刷新、断开登录",
+    description: "WorkBuddy 账户/积分与设置：刷新积分、免费/全部（含付费）模型、断开登录",
     handler: async (args, ctx) => {
       const cmd = String(args ?? "").trim().toLowerCase();
+
+      /**
+       * 积分直达：强制拉取两版（或指定一版）的最新积分并重画卡片。
+       *
+       * 这是"⟳ 刷新"入口的实际执行体：绕过 30s 短缓存（用户显式要求的
+       * 就是最新值），刷新期间状态栏标「刷新中…」，完成回执走 notify。
+       */
+      const refreshCredits = async (which?: "cn" | "ai") => {
+        const targets: VariantRuntime[] = [];
+        if (which === undefined) {
+          targets.push(...runtimes);
+        } else {
+          const target = byId.get(which === "cn" ? CN_VARIANT.id : AI_VARIANT.id);
+          if (target) targets.push(target);
+        }
+        for (const runtime of targets) {
+          if ((await runtime.credentialPresence()) === "absent") continue;
+          ctx.ui.setStatus(runtime.widgetKey, `${runtime.variant.displayName} 刷新中…`);
+        }
+        await Promise.all(targets.map(async (runtime) => {
+          await refreshAll();
+          await paint(runtime, ctx, true, true);
+        }));
+      };
 
       /** 切换模型范围（免费 / 含付费），并给出明确回执。 */
       const setScope = async (next: Scope) => {
@@ -1104,19 +1260,24 @@ export default async function (pi: ExtensionAPI) {
       if (cmd === "logout" || cmd === "disconnect" || cmd === "logout-cn" || cmd === "logout-ai") {
         return void await logout(cmd.endsWith("-cn") ? "cn" : cmd.endsWith("-ai") ? "ai" : undefined);
       }
+      // 积分直达：/workbuddy c（或 credits/r/refresh），可选后缀 -cn / -ai 只刷一版。
+      if (cmd === "c" || cmd === "credits" || cmd === "积分" || cmd === "r" || cmd === "refresh"
+        || cmd === "刷新" || cmd === "c-cn" || cmd === "c-ai" || cmd === "credits-cn" || cmd === "credits-ai"
+        || cmd === "r-cn" || cmd === "r-ai") {
+        return void await refreshCredits(cmd.endsWith("-cn") ? "cn" : cmd.endsWith("-ai") ? "ai" : undefined);
+      }
 
       // 无参数：弹菜单。菜单项直接标出当前状态，避免"点了不知道发生了什么"。
       const paidLabel = scope === "free" ? "列出全部模型（含付费）" : "只列出免费模型";
-      const pick = await ctx.ui.select(`WorkBuddy 设置（当前：${scope === "free" ? "仅免费" : "含付费"}）`, [
-        "刷新模型与积分",
+      const pick = await ctx.ui.select(`WorkBuddy（当前：${scope === "free" ? "仅免费" : "含付费"}）`, [
+        "查看积分（刷新）",
         paidLabel,
         "断开登录",
       ]);
       if (pick === undefined) return;
       if (pick === paidLabel) await setScope(scope === "free" ? "all" : "free");
       else if (pick === "断开登录") await logout();
-      else await refreshAll();
-      for (const runtime of runtimes) await paint(runtime, ctx, true, true);
+      else await refreshCredits();
     },
   });
 }
@@ -1353,6 +1514,48 @@ if (process.argv.includes("--self-check")) {
   if (!lines.some((line) => line.includes("user@example.com"))) throw new Error("widget account");
   if (!lines.some((line) => line.includes("合计 349"))) throw new Error("widget total");
   if (!lines.some((line) => line.includes("WorkBuddy AI"))) throw new Error("widget name");
+  // 卡片必须有刷新入口行，且带直达命令；有刷新时间就一并标注。
+  if (!lines.some((line) => line.includes("⟳ 刷新积分") && line.includes("/workbuddy c"))) {
+    throw new Error("widget refresh hint");
+  }
+  const stamped = widgetLines({
+    variant: AI_VARIANT,
+    cred: { accessToken: "a", refreshToken: "r", expiresAtMs: 0, domain: "www.workbuddy.ai", uid: "u", source: "desktop" },
+    credits: { total: 349, accounts: [{ packageName: "Free", remain: 349, size: 350 }] },
+    scope: "free",
+    models: [],
+    refreshedAt: new Date(2027, 8, 12, 8, 5, 9),
+  });
+  if (!stamped.some((line) => line.includes("更新于 08:05:09"))) throw new Error("widget refreshed-at");
+  // 摘要行：有容量给占比，多包给包数，低余额包计数警示。
+  const summary = creditsSummary({
+    total: 40,
+    accounts: [
+      { packageName: "A", remain: 5, size: 100 },
+      { packageName: "B", remain: 35, size: 350 },
+    ],
+  });
+  if (!summary.includes("40/450") || !summary.includes("9%") || !summary.includes("2 个包") || !summary.includes("⚠ 1 个偏低")) {
+    throw new Error(`credits summary: ${summary}`);
+  }
+  // 明细行：低余额的包排最前（需要关注的先看到），行首 ⚠，带精确数字与百分比。
+  const rows = creditRows({
+    total: 40,
+    accounts: [
+      { packageName: "B", remain: 35, size: 350 },
+      { packageName: "A", remain: 5, size: 100 },
+    ],
+  });
+  const firstPack = rows.find((line) => line.includes("A"));
+  const secondPack = rows.find((line) => line.includes("B"));
+  if (!firstPack || !secondPack || rows.indexOf(firstPack!) > rows.indexOf(secondPack!)) {
+    throw new Error("credit rows: low-balance pack must sort first");
+  }
+  if (!firstPack!.includes("⚠") || !firstPack!.includes("5/100（5%）")) throw new Error("credit rows: warning flag");
+  if (!secondPack!.includes("35/350（10%）")) throw new Error("credit rows: exact numbers");
+  // 无容量信息（size=0）不编造百分比，只报合计。
+  const bare = creditsSummary({ total: 123, accounts: [{ packageName: "X", remain: 123, size: 0 }] });
+  if (bare !== "合计 123") throw new Error(`credits summary bare: ${bare}`);
   // 企业无上限的渲染不带数字。
   const unlimited = widgetLines({
     variant: CN_VARIANT,
